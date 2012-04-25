@@ -9,14 +9,21 @@
   SDIO_D0   -> PC8, pin 39
 */
 
-#define NUM_COMMANDS      3
+#define NUM_COMMANDS      6
 #define NUM_APP_COMMANDS  1
 uint8_t app_command = 0;
+
+uint16_t card_rca = 0; // RCA for host-card communication
+uint32_t cid_table[4]; // table to hold the card identification information
+uint32_t csd_table[4]; // table to hold the card specific information
 
 // This is the LUT for normal commands
 static const CmdInfo command_data[NUM_COMMANDS] = {
   {SD_CMD_GO_IDLE,        SDIO_CMD_RESPONSE_NONE, 1, 1},
   {SD_CMD_SEND_IF_COND,   SDIO_CMD_RESPONSE_R7,   1, 0},
+  {SD_CMD_SET_REL_ADDR,   SDIO_CMD_RESPONSE_R6,   0, 0},
+  {SD_CMD_ALL_SEND_CID,   SDIO_CMD_RESPONSE_R2,   0, 0},
+  {SD_CMD_SEND_CSD,       SDIO_CMD_RESPONSE_R2,   0, 0},
   {SD_CMD_APP_CMD,        SDIO_CMD_RESPONSE_R1,   0, 0}
 };
 
@@ -62,11 +69,17 @@ uint8_t sd_cmd(uint8_t command, uint32_t argument)
     case SDIO_CMD_RESPONSE_NONE:
       break; // do nothing
     
-    case SDIO_CMD_RESPONSE_R7:
     case SDIO_CMD_RESPONSE_R1:
     case SDIO_CMD_RESPONSE_R3:
+    case SDIO_CMD_RESPONSE_R6:
+    case SDIO_CMD_RESPONSE_R7:
       // set the short response
       cmd_reg |= SDIO_CMD_WAITRESP_0;
+      break;
+
+    case SDIO_CMD_RESPONSE_R2:
+      // long response
+      cmd_reg |= SDIO_CMD_WAITRESP_0 | SDIO_CMD_WAITRESP_1;
       break;
   }
 
@@ -80,14 +93,15 @@ uint8_t sd_cmd(uint8_t command, uint32_t argument)
   }
 
   // first check the CRC, then check that the returned command is the same as 
-  // the command we sent. 
+  // the command we sent for R1 and R6
   // note that for Response 3 (OCR register) both of these will always be invalid
   if (cmd->response_type != SDIO_CMD_RESPONSE_R3) {
     if (SDIO->STA & SDIO_STA_CCRCFAIL) {
       CLEAR_SDIO_STATUS;
       return SD_ERROR;
     }
-
+  }
+  if (cmd->response_type == SDIO_CMD_RESPONSE_R1 || cmd->response_type == SDIO_CMD_RESPONSE_R6) {
     // wait a little bit for the register to update
     for (uint16_t i=0; i < 100 && SDIO->RESPCMD != command; i++);
     if (SDIO->RESPCMD != command) {
@@ -95,6 +109,19 @@ uint8_t sd_cmd(uint8_t command, uint32_t argument)
       debug_printf("SD: illegal command, got 0x%X\n", SDIO->RESPCMD);
 #endif
       CLEAR_SDIO_STATUS;
+      return SD_ERROR;
+    }
+  }
+
+  // if the response was an R1, we need to check the error bits
+  if (cmd->response_type == SDIO_CMD_RESPONSE_R1) {
+    // we read it a few times to wait a bit
+    uint32_t resp = 0;
+    for (uint32_t i=0; i<1000; i++) resp = SDIO->RESP1; 
+    if ((resp & SDIO_CMD_RESPONSE_ERROR_BITS) != 0) {
+#ifdef DEBUG
+      debug_printf("SD: card error: 0x%X (masked: 0x%X)\n", resp, resp & SDIO_CMD_RESPONSE_ERROR_BITS);
+#endif
       return SD_ERROR;
     }
   }
@@ -190,26 +217,53 @@ uint8_t sd_init()
 
   /***** Send CMD55 and ACMD41 (card startup) *****/
   // CMD55 means that the next command will be application specific
-  if (sd_cmd(55, 0) == SD_ERROR) return SD_ERROR;
-  // now check that the CMD55 response was ok
-  
-  // we read it a few times to wait a bit
-  uint32_t resp = 0;
-  for (uint32_t i=0; i<1000; i++) resp = SDIO->RESP1; 
-  if ((resp & SDIO_CMD_RESPONSE_ERROR_BITS) != 0) {
+  uint8_t valid_voltage = 0;
+  for (uint16_t i = 0; i < 0xFFFF && valid_voltage == 0; i++) {
+    if (sd_cmd(55, 0) == SD_ERROR) return SD_ERROR;
+    if (sd_cmd(41, SD_VOLTAGE_WINDOW_SD | SD_HIGH_CAPACITY) == SD_ERROR) return SD_ERROR;
+
+    uint32_t resp;
+    for (uint8_t j=0; j<100; j++) resp = SDIO->RESP1;
+    valid_voltage = (((resp >> 31) == 1) ? 1 : 0);
+  }
 #ifdef DEBUG
-    debug_printf("SD: card error: 0x%X (masked: 0x%X)\n", resp, resp & SDIO_CMD_RESPONSE_ERROR_BITS);
+  debug_printf("SD: ACMD41 ok!\n");
+#endif
+
+  /***** Get the card ID information *****/
+  if (sd_cmd(2, 0) == SD_ERROR) return SD_ERROR;
+  // do the first save a bunch of times to introduce a delay
+  for (uint8_t i=0; i < 100; i++) cid_table[0] = SDIO->RESP1;
+  cid_table[1] = SDIO->RESP2;
+  cid_table[2] = SDIO->RESP3;
+  cid_table[3] = SDIO->RESP4;
+
+  /***** Get the RCA via CMD3 (relative card address) from the card *****/
+  if (sd_cmd(3,0) == SD_ERROR) return SD_ERROR;
+
+  // get the response
+  uint32_t resp = SDIO->RESP1;
+  // test the error bits
+  if (resp & (SD_R6_GENERAL_UNKNOWN_ERROR | SD_R6_ILLEGAL_CMD | SD_R6_COM_CRC_FAILED) != 0) {
+#ifdef DEBUG
+    debug_printf("SD: CMD3 error, resp: 0x%X (masked: 0x%X)", resp, resp & (SD_R6_GENERAL_UNKNOWN_ERROR | SD_R6_ILLEGAL_CMD | SD_R6_COM_CRC_FAILED));
 #endif
     return SD_ERROR;
+  } else {
+    card_rca = (resp >> 16);
   }
 
-  // send ACMD41
-  if (sd_cmd(41, SD_VOLTAGE_WINDOW_SD | SD_HIGH_CAPACITY) == SD_ERROR) return SD_ERROR;
+  /***** Get the CSD via CMD9 *****/
+  if (sd_cmd(9,card_rca << 16) == SD_ERROR) return SD_ERROR;
+  // do the first save a bunch of times to introduce a delay
+  for (uint8_t i=0; i < 100; i++) csd_table[0] = SDIO->RESP1;
+  csd_table[1] = SDIO->RESP2;
+  csd_table[2] = SDIO->RESP3;
+  csd_table[3] = SDIO->RESP4;
 
   
-  
 #ifdef DEBUG
-  debug_printf("sd_init ok!");
+  debug_printf("SD: init ok!\n");
 #endif
   return SD_OK;
 }

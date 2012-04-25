@@ -3,7 +3,10 @@
 
 // SD commands
 #define SD_CMD_GO_IDLE                      0     // Go to idle state
+#define SD_CMD_ALL_SEND_CID                 2     // ask the card for its info registers
+#define SD_CMD_SET_REL_ADDR                 3     // set the RCA
 #define SD_CMD_SEND_IF_COND                 8     // send interface conditions (voltage, etc)
+#define SD_CMD_SEND_CSD                     9
 #define SD_CMD_APP_CMD                      55    // notify sd of an incoming application specific command
 #define SD_ACMD_SEND_OP_COND                41    // send operating conditions
 
@@ -28,8 +31,14 @@
 // software timeout threshold
 #define SD_TIMEOUT_THRESHOLD  10000
 
+// for ACMD41
 #define SD_HIGH_CAPACITY                ((u32)0x40000000)
 #define SD_VOLTAGE_WINDOW_SD            ((u32)0x80100000)
+
+// for CMD3
+#define SD_R6_GENERAL_UNKNOWN_ERROR     ((u32)0x00002000)
+#define SD_R6_ILLEGAL_CMD               ((u32)0x00004000)
+#define SD_R6_COM_CRC_FAILED            ((u32)0x00008000)
 
 /* structs */
 
